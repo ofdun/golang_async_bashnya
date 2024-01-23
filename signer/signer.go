@@ -31,9 +31,7 @@ func SingleHash(in, out chan interface{}) {
 
 		go func(data interface{}, out chan interface{}, wg *sync.WaitGroup, m *sync.Mutex) {
 			defer wg.Done()
-
 			var wgLocal sync.WaitGroup
-
 			wgLocal.Add(2)
 			stringifiedData := fmt.Sprintf("%v", data)
 
