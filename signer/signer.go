@@ -2,86 +2,102 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
-	"time"
 )
 
 func ExecutePipeline(jobs ...job) {
-
-}
-
-func runDataSignerCrc32(in <-chan interface{}, out chan<- interface{}) {
-	select {
-	case data := <-in:
-		out <- DataSignerCrc32(data.(string))
+	var wg sync.WaitGroup
+	in := make(chan interface{})
+	out := make(chan interface{})
+	wg.Add(len(jobs))
+	for i := range jobs {
+		go func(in, out chan interface{}, worker job, wg *sync.WaitGroup) {
+			defer wg.Done()
+			defer close(out)
+			worker(in, out)
+		}(in, out, jobs[i], &wg)
+		in, out = out, make(chan interface{})
 	}
+	wg.Wait()
 }
 
 func SingleHash(in, out chan interface{}) {
-	select {
-	case data := <-in:
-		crc32InChan := make(chan interface{}, 1)
-		crc32OutChan := make(chan interface{}, 1)
-		go runDataSignerCrc32(crc32InChan, crc32OutChan)
-		crc32InChan <- data.(string)
+	var mutex sync.Mutex
+	var wg sync.WaitGroup
+	for data := range in {
+		wg.Add(2)
+		stringifiedData := fmt.Sprintf("%v", data)
 
-		go runDataSignerCrc32(crc32InChan, crc32OutChan)
-		md5 := DataSignerMd5(data.(string))
-		crc32InChan <- md5
+		md5OutChan := make(chan string)
+		go func(data string, c chan string, m *sync.Mutex) {
+			defer close(c)
+			m.Lock()
+			c <- DataSignerMd5(data)
+			m.Unlock()
+		}(stringifiedData, md5OutChan, &mutex)
 
-		result := (<-crc32OutChan).(string) + "~" + (<-crc32OutChan).(string)
+		crc32OutChan := make(chan string)
+		go func(data string, c chan string, wg *sync.WaitGroup) {
+			defer wg.Done()
+			defer close(c)
+			c <- DataSignerCrc32(data)
+		}(stringifiedData, crc32OutChan, &wg)
+
+		md5 := <-md5OutChan
+		crc32md5OutChan := make(chan string)
+		go func(data string, c chan string, wg *sync.WaitGroup) {
+			defer wg.Done()
+			defer close(c)
+			c <- DataSignerCrc32(data)
+		}(md5, crc32md5OutChan, &wg)
+
+		result := <-crc32OutChan + "~" + <-crc32md5OutChan
 		out <- result
-		close(out)
 	}
-}
-
-func Test() {
-	start := time.Now()
-
-	singleHashIn := make(chan interface{}, 1)
-	singleHashOut := make(chan interface{}, 1)
-
-	go SingleHash(singleHashIn, singleHashOut)
-	singleHashIn <- "0" // TODO
-	singleHash := (<-singleHashOut).(string)
-
-	multiHashIn := make(chan interface{}, 6)
-	multiHashOut := make(chan interface{}, 6)
-	slice := make([]string, 0, 6)
-
-	go func() {
-		for i := 0; i < 6; i++ {
-			multiHashIn <- strconv.Itoa(i) + singleHash
-		}
-		close(multiHashIn)
-	}()
-
-	go MultiHash(multiHashIn, multiHashOut)
-
-	for val := range multiHashOut {
-		slice = append(slice, val.(string))
-	}
-
-	fmt.Println(slice)
-	fmt.Println(time.Since(start))
 }
 
 func MultiHash(in, out chan interface{}) {
+	slice := make([]string, 6)
 	var wg sync.WaitGroup
-
-	for i := 0; i < 6; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runDataSignerCrc32(in, out)
-		}()
+	for val := range in {
+		stringifiedData := fmt.Sprintf("%v", val)
+		wg.Add(6)
+		for i := 0; i < 6; i++ {
+			go func(index int) {
+				slice[index] = DataSignerCrc32(strconv.Itoa(index) + stringifiedData)
+				wg.Done()
+			}(i)
+		}
+		wg.Wait()
+		str := func(slice []string) string {
+			contactedStr := ""
+			for i := range slice {
+				contactedStr += slice[i]
+			}
+			return contactedStr
+		}(slice)
+		out <- str
 	}
-
-	wg.Wait()
-	close(out)
 }
 
 func CombineResults(in, out chan interface{}) {
-
+	var slice []string
+	for val := range in {
+		slice = append(slice, fmt.Sprintf("%v", val))
+	}
+	sort.Strings(slice)
+	str := func(slice []string) string {
+		str := ""
+		for i := range slice {
+			if i == 0 {
+				str = slice[i]
+			} else {
+				str += "_" + slice[i]
+			}
+		}
+		return str
+	}(slice)
+	out <- str
 }
