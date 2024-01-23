@@ -43,7 +43,7 @@ func SingleHash(in, out chan interface{}) {
 				m.Lock()
 				c <- DataSignerMd5(data)
 				m.Unlock()
-			}(stringifiedData, md5OutChan, &mutex)
+			}(stringifiedData, md5OutChan, m)
 
 			crc32OutChan := make(chan string)
 			go func(data string, c chan string, wg *sync.WaitGroup) {
