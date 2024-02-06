@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -11,8 +12,8 @@ func ExecutePipeline(jobs ...job) {
 	var wg sync.WaitGroup
 	in := make(chan interface{})
 	out := make(chan interface{})
-	wg.Add(len(jobs))
 	for i := range jobs {
+		wg.Add(1)
 		go func(in, out chan interface{}, worker job, wg *sync.WaitGroup) {
 			defer wg.Done()
 			defer close(out)
@@ -23,75 +24,77 @@ func ExecutePipeline(jobs ...job) {
 	wg.Wait()
 }
 
+func calcCrc32SingleHash(data string, c chan string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer close(c)
+	c <- DataSignerCrc32(data)
+}
+
+func asyncCalcOneSingleHash(data interface{}, out chan interface{}, wg *sync.WaitGroup, m *sync.Mutex) {
+	defer wg.Done()
+	var wgLocal sync.WaitGroup
+	wgLocal.Add(2)
+	stringifiedData := fmt.Sprintf("%v", data)
+
+	md5OutChan := make(chan string)
+	go func(data string, c chan string, m *sync.Mutex) {
+		defer close(c)
+		m.Lock()
+		c <- DataSignerMd5(data)
+		m.Unlock()
+	}(stringifiedData, md5OutChan, m)
+
+	crc32OutChan := make(chan string)
+	go calcCrc32SingleHash(stringifiedData, crc32OutChan, &wgLocal)
+
+	md5 := <-md5OutChan
+	crc32md5OutChan := make(chan string)
+	go calcCrc32SingleHash(md5, crc32md5OutChan, &wgLocal)
+
+	result := <-crc32OutChan + "~" + <-crc32md5OutChan
+	out <- result
+}
+
 func SingleHash(in, out chan interface{}) {
 	var wgGlobal sync.WaitGroup
 	var mutex sync.Mutex
 	for data := range in {
 		wgGlobal.Add(1)
-
-		go func(data interface{}, out chan interface{}, wg *sync.WaitGroup, m *sync.Mutex) {
-			defer wg.Done()
-			var wgLocal sync.WaitGroup
-			wgLocal.Add(2)
-			stringifiedData := fmt.Sprintf("%v", data)
-
-			md5OutChan := make(chan string)
-			go func(data string, c chan string, m *sync.Mutex) {
-				defer close(c)
-				m.Lock()
-				c <- DataSignerMd5(data)
-				m.Unlock()
-			}(stringifiedData, md5OutChan, m)
-
-			crc32OutChan := make(chan string)
-			go func(data string, c chan string, wg *sync.WaitGroup) {
-				defer wg.Done()
-				defer close(c)
-				c <- DataSignerCrc32(data)
-			}(stringifiedData, crc32OutChan, &wgLocal)
-
-			md5 := <-md5OutChan
-			crc32md5OutChan := make(chan string)
-			go func(data string, c chan string, wg *sync.WaitGroup) {
-				defer wg.Done()
-				defer close(c)
-				c <- DataSignerCrc32(data)
-			}(md5, crc32md5OutChan, &wgLocal)
-
-			result := <-crc32OutChan + "~" + <-crc32md5OutChan
-			out <- result
-		}(data, out, &wgGlobal, &mutex)
+		go asyncCalcOneSingleHash(data, out, &wgGlobal, &mutex)
 	}
 	wgGlobal.Wait()
 }
 
+func asyncCalcOneMultiHash(data interface{}, out chan interface{}, wgGlobal *sync.WaitGroup, th int) {
+	defer wgGlobal.Done()
+
+	slice := make([]string, th)
+	var wg sync.WaitGroup
+	stringifiedData := fmt.Sprintf("%v", data)
+	for i := 0; i < th; i++ {
+		wg.Add(1)
+		go func(index int) {
+			slice[index] = DataSignerCrc32(strconv.Itoa(index) + stringifiedData)
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+	str := func(slice []string) string {
+		contactedStr := ""
+		for i := range slice {
+			contactedStr += slice[i]
+		}
+		return contactedStr
+	}(slice)
+	out <- str
+}
+
 func MultiHash(in, out chan interface{}) {
 	var wgGlobal sync.WaitGroup
+	const th int = 6
 	for data := range in {
 		wgGlobal.Add(1)
-		go func(data interface{}, out chan interface{}, wgGlobal *sync.WaitGroup) {
-			defer wgGlobal.Done()
-
-			slice := make([]string, 6)
-			var wg sync.WaitGroup
-			stringifiedData := fmt.Sprintf("%v", data)
-			wg.Add(6)
-			for i := 0; i < 6; i++ {
-				go func(index int) {
-					slice[index] = DataSignerCrc32(strconv.Itoa(index) + stringifiedData)
-					wg.Done()
-				}(i)
-			}
-			wg.Wait()
-			str := func(slice []string) string {
-				contactedStr := ""
-				for i := range slice {
-					contactedStr += slice[i]
-				}
-				return contactedStr
-			}(slice)
-			out <- str
-		}(data, out, &wgGlobal)
+		go asyncCalcOneMultiHash(data, out, &wgGlobal, th)
 	}
 	wgGlobal.Wait()
 }
@@ -102,16 +105,6 @@ func CombineResults(in, out chan interface{}) {
 		slice = append(slice, fmt.Sprintf("%v", val))
 	}
 	sort.Strings(slice)
-	str := func(slice []string) string {
-		str := ""
-		for i := range slice {
-			if i == 0 {
-				str = slice[i]
-			} else {
-				str += "_" + slice[i]
-			}
-		}
-		return str
-	}(slice)
+	str := strings.Join(slice, "_")
 	out <- str
 }
